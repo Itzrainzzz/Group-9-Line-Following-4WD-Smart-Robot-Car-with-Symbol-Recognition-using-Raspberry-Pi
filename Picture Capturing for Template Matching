@@ -4,7 +4,7 @@ import time
 import os
 
 # Folder to save images
-save_dir = "/home/powerrangers/template_matching_w3/hi"
+save_dir = "/home/powerrangers/template_matching_w3/uncropped_images"
 os.makedirs(save_dir, exist_ok=True)
 
 # Initialize camera
