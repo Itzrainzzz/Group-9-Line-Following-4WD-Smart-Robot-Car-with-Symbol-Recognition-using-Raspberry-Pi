@@ -1,0 +1,233 @@
+import cv2
+import numpy as np
+import RPi.GPIO as GPIO
+import time
+import os
+from picamera2 import Picamera2
+import threading
+import queue
+
+# === CONFIGURATION ===
+TEMPLATE_DIR = "/home/powerrangers/template_matching_w3/cropped_images"
+MATCH_THRESHOLD = 0.80
+
+# Shared state
+symbol_detected = False
+symbol_detected_lock = threading.Lock()
+symbol_detected_time = 0
+stopping = False
+frame_queue = queue.Queue(maxsize=1)
+detected_symbol_name = ""
+
+# PID parameters (default values)
+Kp = 1.2
+Ki = 0.0
+Kd = 0.2
+last_error = 0
+integral = 0
+
+# Load templates
+templates = []
+for fname in os.listdir(TEMPLATE_DIR):
+    if fname.endswith(".jpg") or fname.endswith(".png"):
+        label = os.path.splitext(fname)[0]
+        template = cv2.imread(os.path.join(TEMPLATE_DIR, fname), 0)
+        templates.append((label, template))
+
+# Motor GPIO Setup
+IN1, IN2, ENA = 17, 18, 19
+IN3, IN4, ENB = 22, 23, 12
+ENCODER_A, ENCODER_B = 21, 20
+SERVO_PIN = 5
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setup([IN1, IN2, ENA, IN3, IN4, ENB], GPIO.OUT)
+GPIO.setup([ENCODER_A, ENCODER_B], GPIO.IN, pull_up_down=GPIO.PUD_UP)
+GPIO.setup(SERVO_PIN, GPIO.OUT)
+
+pwm_left = GPIO.PWM(ENA, 1000)
+pwm_right = GPIO.PWM(ENB, 1000)
+pwm_left.start(0)
+pwm_right.start(0)
+
+# Camera init
+picam2 = Picamera2()
+preview_config = picam2.create_preview_configuration(
+    main={"size": (320, 240), "format": "RGB888"},
+    controls={"FrameRate": 40.0}
+)
+picam2.configure(preview_config)
+picam2.start()
+
+time_last_detected = time.time()
+
+def set_motors(left_speed, right_speed):
+    GPIO.output(IN1, GPIO.HIGH if left_speed >= 0 else GPIO.LOW)
+    GPIO.output(IN2, GPIO.LOW if left_speed >= 0 else GPIO.HIGH)
+    GPIO.output(IN3, GPIO.HIGH if right_speed >= 0 else GPIO.LOW)
+    GPIO.output(IN4, GPIO.LOW if right_speed >= 0 else GPIO.HIGH)
+    pwm_left.ChangeDutyCycle(min(abs(left_speed), 100))
+    pwm_right.ChangeDutyCycle(min(abs(right_speed), 100))
+
+def stop():
+    GPIO.output(IN1, GPIO.LOW)
+    GPIO.output(IN2, GPIO.LOW)
+    GPIO.output(IN3, GPIO.LOW)
+    GPIO.output(IN4, GPIO.LOW)
+
+def detect_templates(gray, display_frame):
+    global symbol_detected_time, detected_symbol_name
+    detected = False
+    symbol_name = ""
+    for label, template in templates:
+        res = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED)
+        loc = np.where(res >= MATCH_THRESHOLD)
+        if len(loc[0]) > 0:
+            symbol_name = label
+            detected = True
+            print(f"Detected symbol: {label}")
+            break
+    return detected, symbol_name
+
+def template_matching_thread():
+    global symbol_detected, symbol_detected_time, detected_symbol_name
+    while True:
+        try:
+            frame = frame_queue.get(timeout=1)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            detected, symbol_name = detect_templates(gray, frame)
+            with symbol_detected_lock:
+                if not stopping:
+                    symbol_detected = detected
+                    detected_symbol_name = symbol_name
+                    if detected:
+                        symbol_detected_time = time.time()
+            frame_queue.task_done()
+        except queue.Empty:
+            continue
+
+def process_frame(frame, priority_colors=['green', 'blue']): # Placeholder for priority colours
+    global time_last_detected, symbol_detected, symbol_detected_time, stopping, detected_symbol_name
+    global last_error, integral, Kp, Ki, Kd
+
+    frame = cv2.resize(frame, (320, 240))
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+    try:
+        frame_queue.put_nowait(frame.copy())
+    except queue.Full:
+        pass
+
+    color_ranges = {
+        'black': [(0, 0, 0), (180, 255, 80)],
+        'red': [(0, 120, 70), (10, 255, 255), (170, 120, 70), (180, 255, 255)],
+        'yellow': [(20, 100, 100), (30, 255, 255)],
+        'green': [(40, 50, 50), (80, 255, 255)],
+        'blue': [(100, 100, 0), (140, 255, 255)]
+    }
+
+    height, width = frame.shape[:2]
+    roi_top = int(height / 2)
+    active_mask = None
+    tracking_mode = "black"
+
+    for color in priority_colors:
+        ranges = color_ranges[color]
+        if len(ranges) == 2:
+            mask = cv2.inRange(hsv, np.array(ranges[0]), np.array(ranges[1]))
+        else:
+            mask1 = cv2.inRange(hsv, np.array(ranges[0]), np.array(ranges[1]))
+            mask2 = cv2.inRange(hsv, np.array(ranges[2]), np.array(ranges[3]))
+            mask = cv2.bitwise_or(mask1, mask2)
+        roi_mask = mask[roi_top:, :]
+        if np.sum(roi_mask) // 255 > 500:
+            active_mask = mask
+            tracking_mode = color
+            break
+
+    if active_mask is None:
+        active_mask = cv2.inRange(hsv, np.array(color_ranges['black'][0]), np.array(color_ranges['black'][1]))
+
+    roi = active_mask[roi_top:, :]
+    moments = cv2.moments(roi)
+
+    with symbol_detected_lock:
+        if symbol_detected and not stopping:
+            stopping = True
+            stop()
+            print("Symbol detected! Stopping for 3 seconds...")
+            time.sleep(3)
+            print("Resuming line tracking...")
+            symbol_detected = False
+            detected_symbol_name = ""
+            stopping = False
+
+    if stopping:
+        return
+
+    if moments['m00'] > 0:
+        time_last_detected = time.time()
+        cx = int(moments['m10'] / moments['m00'])
+        cv2.circle(frame, (cx, height - 10), 5, (0, 0, 255), -1)
+
+        # --- PID Control ---
+        error = (width // 2) - cx
+        integral += error
+        derivative = error - last_error
+        correction = Kp * error + Ki * integral + Kd * derivative
+        last_error = error
+        
+        base_speed = 30
+        left_speed = base_speed - correction
+        right_speed = base_speed + correction
+
+        left_speed = max(min(left_speed, 100), -100)
+        right_speed = max(min(right_speed, 100), -100)
+        set_motors(left_speed, right_speed)
+    else:
+        if time.time() - time_last_detected > 1:
+            set_motors(-40, -40)
+        else:
+            stop()
+
+    # Display debugging info
+    cv2.putText(frame, f"Tracking: {tracking_mode}", (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    with symbol_detected_lock:
+        if detected_symbol_name:
+            cv2.putText(frame, f"Symbol: {detected_symbol_name}", (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    cv2.putText(frame, f"Kp: {Kp:.2f} Ki: {Ki:.2f} Kd: {Kd:.2f}", (10, 420),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+    cv2.imshow("Tracking + Arrows", frame)
+
+def adjust_pid(key):
+    global Kp, Ki, Kd
+    if key == ord('q'): Kp += 0.05
+    elif key == ord('w'): Kp = max(0, Kp - 0.05)
+    elif key == ord('a'): Ki += 0.01
+    elif key == ord('s'): Ki = max(0, Ki - 0.01)
+    elif key == ord('z'): Kd += 0.05
+    elif key == ord('x'): Kd = max(0, Kd - 0.05)
+
+def main():
+    template_thread = threading.Thread(target=template_matching_thread, daemon=True)
+    template_thread.start()
+
+    try:
+        while True:
+            frame = picam2.capture_array()
+            process_frame(frame, priority_colors=['yellow', 'blue']) # Actual priority colours
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q') or key == ord('w') or key == ord('a') or key == ord('s') or key == ord('z') or key == ord('x'):
+                adjust_pid(key)
+            elif key == ord('e'):  # Exit key
+                break
+    finally:
+        stop()
+        GPIO.cleanup()
+        cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
