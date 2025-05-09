@@ -1,0 +1,86 @@
+# Template Matching - Manual Photos Cropping
+
+import cv2
+import os
+
+# === CONFIG ===
+INPUT_FOLDER = "/home/powerrangers/template_matching_w3/uncropped_images"
+OUTPUT_FOLDER = "/home/powerrangers/template_matching_w3/cropped_images"
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+# === Global State ===
+ref_point = []
+cropping = False
+current_image = None
+current_filename = ""
+clone = None
+
+def click_and_crop(event, x, y, flags, param):
+    global ref_point, cropping, clone
+
+    if event == cv2.EVENT_LBUTTONDOWN:
+        ref_point = [(x, y)]
+        cropping = True
+
+    elif event == cv2.EVENT_MOUSEMOVE and cropping:
+        temp = clone.copy()
+        cv2.rectangle(temp, ref_point[0], (x, y), (0, 255, 0), 2)
+        cv2.imshow("Image", temp)
+
+    elif event == cv2.EVENT_LBUTTONUP:
+        ref_point.append((x, y))
+        cropping = False
+        cv2.rectangle(clone, ref_point[0], ref_point[1], (0, 255, 0), 2)
+        cv2.imshow("Image", clone)
+
+# === Main Loop ===
+for filename in os.listdir(INPUT_FOLDER):
+    if filename.endswith(".jpg") or filename.endswith(".png"):
+        path = os.path.join(INPUT_FOLDER, filename)
+        image = cv2.imread(path)
+        if image is None:
+            print(f"Failed to load {filename}")
+            continue
+
+        current_image = image.copy()
+        current_filename = filename
+        clone = image.copy()
+        ref_point = []
+        cropping = False
+
+        cv2.namedWindow("Image")
+        cv2.setMouseCallback("Image", click_and_crop)
+
+        print(f"\nCropping: {filename}")
+        while True:
+            cv2.imshow("Image", clone)
+            key = cv2.waitKey(1) & 0xFF
+
+            if key == ord("r"):
+                clone = current_image.copy()
+                ref_point = []
+                cropping = False
+                print("?? Reset image.")
+
+            elif key == ord("c"):
+                print("? Crop canceled. Try again.")
+                clone = current_image.copy()
+                ref_point = []
+                cropping = False
+
+            elif key == ord("s") and len(ref_point) == 2:
+                x1, y1 = ref_point[0]
+                x2, y2 = ref_point[1]
+                roi = current_image[min(y1, y2):max(y1, y2), min(x1, x2):max(x1, x2)]
+                save_path = os.path.join(OUTPUT_FOLDER, filename)
+                cv2.imwrite(save_path, roi)
+                print(f"? Saved: {save_path}")
+                break
+
+            elif key == ord("q"):
+                print("?? Exiting.")
+                exit()
+
+        cv2.destroyAllWindows()
+
+print("\nDone! All crops saved to:", OUTPUT_FOLDER)
